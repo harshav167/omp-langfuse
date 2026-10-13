@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { TracingAPI, TracingContext, TracingEvent as ExtensionEvent } from "../src/index.ts";
+import type { TracingAPI, TracingContext, TracingEvent as ExtensionEvent, TracingOptions } from "../src/index.ts";
 import { flushTracing, registerTracing, shutdownTracing } from "../src/index.ts";
 import type { CapturedSpan } from "./helpers.ts";
 import { startCaptureServer } from "./helpers.ts";
@@ -43,7 +43,7 @@ async function fixture() {
   };
   return {
     api, capture, emit, prompt, tool,
-    register: () => registerTracing(api, { publicKey: "pk-lf-test", secretKey: "sk-lf-test", baseUrl: `http://127.0.0.1:${capture.port}` }),
+    register: (options: TracingOptions = {}) => registerTracing(api, { publicKey: "pk-lf-test", secretKey: "sk-lf-test", baseUrl: `http://127.0.0.1:${capture.port}` }, options),
     close: async () => {
       try {
         await emit({ type: "session_shutdown" });
@@ -57,6 +57,8 @@ async function fixture() {
   };
 }
 
+const USAGE = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+
 function rootFor(spans: CapturedSpan[], prompt: string): CapturedSpan | undefined {
   return spans.find(span => {
     if (span.name !== "omp-agent") return false;
@@ -67,11 +69,13 @@ function rootFor(spans: CapturedSpan[], prompt: string): CapturedSpan | undefine
   });
 }
 
-function assertToolParent(spans: CapturedSpan[], prompt: string) {
-  const root = rootFor(spans, prompt);
+const steersOf = (spans: CapturedSpan[]) =>
+  spans.filter(span => span.name === "steer").map(span => JSON.parse(String(span.attrs["langfuse.observation.input"])).content);
+
+function assertToolParent(spans: CapturedSpan[], root: CapturedSpan | undefined) {
   const tool = spans.find(span => span.name === "bash");
   assert.ok(root);
-  assert.ok(tool, "the interrupted turn must not discard the new prompt's tool");
+  assert.ok(tool, "the running turn must not discard its tool");
   assert.equal(tool.parentSpanId, root.spanId);
   assert.equal(tool.attrs["langfuse.observation.output"], "fixture result");
   assert.ok(root.endNs >= tool.endNs, "the root must cover its completed tool");
@@ -79,13 +83,15 @@ function assertToolParent(spans: CapturedSpan[], prompt: string) {
 
 describe("agent_end ordering", () => {
   for (const lateEndAfterStart of [false, true]) {
-    it(`keeps the replacement trace when the old end arrives ${lateEndAfterStart ? "after" : "before"} its agent_start`, async () => {
+    it(`keeps a steer in the running trace when the old loop's end arrives ${lateEndAfterStart ? "after" : "before"} the restart`, async () => {
       const f = await fixture();
       try {
         f.register();
         await f.prompt("first");
         await f.emit({ type: "agent_start" });
-        await f.prompt("replacement");
+        // OMP delivers the steer by aborting the loop and restarting it; the
+        // aborted loop's fire-and-forget end can land on either side of the restart.
+        await f.prompt("also check the tests");
         if (lateEndAfterStart) await f.emit({ type: "agent_start" });
         await f.emit({ type: "agent_end", messages: [] });
         if (!lateEndAfterStart) await f.emit({ type: "agent_start" });
@@ -93,8 +99,12 @@ describe("agent_end ordering", () => {
         await f.emit({ type: "agent_end", messages: [] });
         await flushTracing();
         const spans = f.capture.spans();
-        assert.equal(spans.filter(span => span.name === "omp-agent").length, 2);
-        assertToolParent(spans, "replacement");
+        assert.equal(spans.filter(span => span.name === "omp-agent").length, 1);
+        const root = rootFor(spans, "first");
+        assertToolParent(spans, root);
+        assert.deepEqual(steersOf(spans), ["also check the tests"]);
+        assert.equal(root?.attrs["langfuse.observation.metadata.steer_count"], "1");
+        assert.equal(root?.attrs["langfuse.observation.metadata.cancelled"], undefined);
         await f.tool();
         await flushTracing();
         assert.equal(f.capture.spans().filter(span => span.name === "bash").length, 1, "the settled trace must not keep accepting tools");
@@ -104,7 +114,7 @@ describe("agent_end ordering", () => {
     });
   }
 
-  it("drains multiple superseded runs without closing the latest prompt", async () => {
+  it("keeps several steers in one trace until the last loop ends", async () => {
     const f = await fixture();
     try {
       f.register();
@@ -118,10 +128,34 @@ describe("agent_end ordering", () => {
       await f.emit({ type: "agent_end", messages: [] });
       await flushTracing();
       const spans = f.capture.spans();
-      assert.equal(spans.filter(span => span.name === "omp-agent").length, 3);
-      assertToolParent(spans, "latest");
-      assert.equal(rootFor(spans, "first")?.attrs["langfuse.observation.metadata.cancelled"], "true");
-      assert.equal(rootFor(spans, "second")?.attrs["langfuse.observation.metadata.cancelled"], "true");
+      assert.equal(spans.filter(span => span.name === "omp-agent").length, 1);
+      assertToolParent(spans, rootFor(spans, "first"));
+      assert.deepEqual(steersOf(spans), ["second", "latest"]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("joins the restart to an interrupted turn and reports the interrupt, not an error", async () => {
+    const f = await fixture();
+    try {
+      f.register();
+      await f.prompt("audit");
+      await f.emit({ type: "agent_start" });
+      await f.emit({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [], api: "openai-completions", provider: "fixture", model: "fixture", stopReason: "aborted", usage: USAGE, timestamp: Date.now() }],
+      });
+      await f.emit({ type: "agent_start" });
+      await f.tool();
+      await f.emit({ type: "agent_end", messages: [] });
+      await flushTracing();
+      const spans = f.capture.spans();
+      assert.equal(spans.filter(span => span.name === "omp-agent").length, 1);
+      const root = rootFor(spans, "audit");
+      assertToolParent(spans, root);
+      assert.equal(root?.attrs["langfuse.observation.metadata.interrupted"], "true");
+      assert.equal(root?.attrs["langfuse.observation.level"], undefined);
     } finally {
       await f.close();
     }
@@ -140,7 +174,7 @@ describe("agent_end ordering", () => {
       await flushTracing();
       const spans = f.capture.spans();
       assert.equal(spans.filter(span => span.name === "omp-agent").length, 1);
-      assertToolParent(spans, "continue this");
+      assertToolParent(spans, rootFor(spans, "continue this"));
     } finally {
       await f.close();
     }
@@ -172,22 +206,59 @@ describe("agent_end ordering", () => {
     }
   });
 
-  it("keeps a new prompt's trace open when the prompt-less run it superseded ends late", async () => {
+  it("keeps a prompt typed during a prompt-less run inside that run's trace", async () => {
     const f = await fixture();
     try {
       f.register();
       await f.emit({ type: "agent_start" });
       await f.emit({ type: "before_provider_request", payload: { model: "fixture", messages: [{ role: "user", content: "earlier prompt" }] } });
+      // OMP queues a prompt typed while a run streams as a steer of that run.
       await f.prompt("new prompt");
       await f.emit({ type: "agent_start" });
-      // The background run's end carries no message the tracer owns.
       await f.emit({ type: "agent_end", messages: [] });
       await f.tool();
       await f.emit({ type: "agent_end", messages: [] });
       await flushTracing();
       const spans = f.capture.spans();
-      assert.equal(spans.filter(span => span.name === "omp-agent").length, 2);
-      assertToolParent(spans, "new prompt");
+      const roots = spans.filter(span => span.name === "omp-agent");
+      assert.equal(roots.length, 1);
+      assertToolParent(spans, roots[0]);
+      assert.deepEqual(steersOf(spans), ["new prompt"]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("pairs the reply with its own request when a side request arrives before streaming starts", async () => {
+    const f = await fixture();
+    try {
+      // The tracer's clock is injectable, so the two requests get distinct start times without real waiting.
+      let clock = Date.now();
+      f.register({ now: () => new Date(clock) });
+      await f.prompt("hello");
+      await f.emit({ type: "agent_start" });
+      const sentAt = clock;
+      await f.emit({ type: "before_provider_request", payload: { model: "fixture", messages: [{ role: "user", content: "hello" }] } });
+      clock += 50;
+      await f.emit({ type: "before_provider_request", payload: { model: "fixture", messages: [{ role: "user", content: "prewalk side request" }] } });
+      await f.emit({
+        type: "message_end",
+        // omp stamps the assistant message with the time it sent the main request.
+        message: { role: "assistant", content: [{ type: "text", text: "Hi." }], api: "openai-completions", provider: "fixture", model: "fixture", stopReason: "stop", timestamp: sentAt - 1 },
+      });
+      await f.emit({ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: [], api: "openai-completions", provider: "fixture", model: "fixture", stopReason: "stop", usage: USAGE, timestamp: sentAt }, toolResults: [] });
+      await f.emit({ type: "agent_end", messages: [] });
+      await flushTracing();
+      const generations = f.capture.spans().filter(span => span.name === "call-llm");
+      assert.equal(generations.length, 2);
+      const side = generations.find(span => span.attrs["langfuse.observation.metadata.unmatched_request"] === "true");
+      const main = generations.find(span => span !== side);
+      assert.ok(main);
+      assert.ok(side);
+      assert.ok(main.startNs < side.startNs, "the reply must pair with the earlier, main request");
+      assert.equal(JSON.parse(String(main.attrs["langfuse.observation.output"])).content, "Hi.");
+      assert.equal(side.attrs["langfuse.observation.output"], undefined);
+      assert.equal(side.attrs["langfuse.observation.metadata.unmatched_request"], "true");
     } finally {
       await f.close();
     }
@@ -225,21 +296,22 @@ describe("agent_end ordering", () => {
     }
   });
 
-  it("settles a turn whose promised continuation never arrived as complete, not cancelled", async () => {
+  it("keeps a prompt queued behind a promised continuation inside the turn as a steer", async () => {
     const f = await fixture();
     try {
       f.register();
       await f.prompt("first");
       await f.emit({ type: "agent_start" });
       await f.emit({ type: "agent_end", messages: [], willContinue: true });
+      // OMP queues anything typed while a retry backoff is pending and dequeues it on the restart.
       await f.prompt("second");
       await f.emit({ type: "agent_start" });
       await f.emit({ type: "agent_end", messages: [] });
       await flushTracing();
-      const first = rootFor(f.capture.spans(), "first");
-      assert.ok(first);
-      assert.equal(first.attrs["langfuse.observation.metadata.cancelled"], undefined);
-      assert.equal(first.attrs["langfuse.observation.metadata.continuation_missing"], "true");
+      const spans = f.capture.spans();
+      assert.equal(spans.filter(span => span.name === "omp-agent").length, 1);
+      assert.deepEqual(steersOf(spans), ["second"]);
+      assert.equal(rootFor(spans, "first")?.attrs["langfuse.observation.metadata.cancelled"], undefined);
     } finally {
       await f.close();
     }

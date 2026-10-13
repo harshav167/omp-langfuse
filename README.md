@@ -20,6 +20,14 @@ Langfuse as its own trace:
 - **Runs without a prompt**: runs OMP starts on its own, such as live
   delegation, background job results and MCP notices, get their own trace with
   `turn_trigger: continuation` in the turn metadata.
+- **Steering and follow-ups**: a prompt OMP delivers into a running turn, by
+  queueing it or by aborting and restarting the loop, stays inside that turn's
+  trace as a `steer` event; `steer_count` and `interrupted` on the turn record
+  what happened. The turn ends when its last loop ends.
+- **Side requests**: requests OMP sends while a reply is still pending (prewalk,
+  memory recall) are paired by the time OMP stamped on each assistant message,
+  so the reply lands on its own generation; an unanswered request closes as
+  `unmatched_request` when the turn ends.
 - **Session title**: OMP's session title is the trace tag `title:<title>` (first
   120 characters) and the turn metadata `session_title`.
 - **Agent-loop generations**: provider-visible inputs, assistant outputs,

@@ -43,6 +43,7 @@ const TRACE_NAME = "omp-turn";
 const MAIN_AGENT_OBSERVATION_NAME = "omp-agent";
 const GENERATION_OBSERVATION_NAME = "call-llm";
 const TITLE_OBSERVATION_NAME = "generate-title";
+const STEER_OBSERVATION_NAME = "steer";
 const COMPACTION_OBSERVATION_NAME = "compact-context";
 const BRANCH_SUMMARY_OBSERVATION_NAME = "summarize-branch";
 const TOOL_USAGE_OBSERVATION_NAME = "tool-llm-usage";
@@ -60,6 +61,17 @@ const SWITCH_MODEL_OBSERVATION_NAME = "switch-model";
 const SWITCH_ACCOUNT_OBSERVATION_NAME = "switch-account";
 const EXPORT_EXCLUDED_ATTRIBUTE = "omp.langfuse.export_excluded";
 const BASE_TAGS = ["omp"];
+/**
+ * How long an aborted run's turn stays open. OMP restarts the loop to deliver a
+ * steer by aborting it, and its `agent_end` notification is fire-and-forget, so
+ * the restart (or the steer's `before_agent_start`) can land just after it.
+ */
+export const RESTART_GRACE_MS = 2000;
+/**
+ * How long a turn whose `agent_end` promised an automatic continuation (retry
+ * backoff, compaction, stop hook) waits for the restart before settling anyway.
+ */
+export const CONTINUATION_GRACE_MS = 5 * 60_000;
 
 /** Read-only lookup tools are typed `retriever`; every other tool stays `tool`. */
 const RETRIEVER_TOOLS: ReadonlySet<string> = new Set([
@@ -560,6 +572,8 @@ export interface TracingAssistantMessage {
  errorStatus?: number;
  ttft?: number;
  duration?: number;
+ /** When omp sent the request this message answers; pairs the message with its generation. */
+ timestamp?: number;
  disabledFeatures?: string[];
  /** Stored credential row (account) that served the reply. */
  credentialId?: number;
@@ -835,6 +849,8 @@ interface OpenGeneration {
  index: number;
  startedAt: Date;
  sawFirstToken: boolean;
+ /** An assistant message is streaming for this request; a late `turn_end` must not sweep it. */
+ bound: boolean;
  finished: boolean;
 }
 
@@ -853,7 +869,8 @@ interface PromptState {
  root: LangfuseAgent;
  turnNumber: number;
  generationCount: number;
- openGeneration?: OpenGeneration;
+ /** Requests sent but not yet answered, oldest first. Side requests omp sends while a reply streams stay here until the turn ends. */
+ openGenerations: OpenGeneration[];
  openTools: Map<string, OpenTool>;
  pendingToolResults: Array<{ tool_call_id: string; name: string; content: string }>;
  lastAssistantText?: string;
@@ -863,6 +880,15 @@ interface PromptState {
  systemPrompt?: string;
  /** Runs of this prompt that reported `agent_start` but not yet `agent_end`. */
  runsOpen: number;
+ /** The last run ended but OMP is expected to start another for this prompt (retry, steer restart). */
+ awaitingRestart: boolean;
+ /** A steer arrived and no loop has started or progressed since: its restart may still be coming. */
+ steerPendingStart: boolean;
+ /** Finalizes an aborted turn if no restart arrives within {@link RESTART_GRACE_MS}. */
+ settleTimer?: NodeJS.Timeout;
+ /** The user interrupted at least one run. An interrupt is not an error. */
+ interrupted: boolean;
+ steers: number;
  promptSequence: number;
 }
 
@@ -1220,17 +1246,18 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    tool.obs.end(now());
   }
   state.openTools.clear();
-  const gen = state.openGeneration;
-  if (gen && !gen.finished) {
+  for (const gen of state.openGenerations) {
+   if (gen.finished) continue;
    gen.obs.update({ level: "WARNING", statusMessage: `Generation ${reason}`, metadata: { [reason]: true } });
    gen.obs.end(now());
    gen.finished = true;
   }
-  state.openGeneration = undefined;
+  state.openGenerations = [];
  };
 
  const finalizeRoot = (opts: { cancelled: boolean; continuationMissing?: boolean }) => {
   if (!state) return;
+  clearTimeout(state.settleTimer);
   closeDanglingObservations("interrupted");
   const media = EMIT_IMAGE_MEDIA ? state.turnImages : [];
   if (media.length) sessionHadImages = true;
@@ -1240,6 +1267,8 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    level: state.sawError ? "ERROR" : undefined,
    metadata: {
     ...(state.turnImages.length ? { image_count: state.turnImages.length } : {}),
+    ...(state.steers ? { steer_count: state.steers } : {}),
+    ...(state.interrupted ? { interrupted: true } : {}),
     ...(opts.cancelled ? { cancelled: true } : {}),
     ...(opts.continuationMissing ? { continuation_missing: true } : {}),
    },
@@ -1248,6 +1277,25 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
   if (liveTurns.get(state.registryKey) === state) liveTurns.delete(state.registryKey);
   if (state.agent.kind === "main" && !options.replay) withdrawParentContext(state.root);
   state = undefined;
+ };
+
+ /** Arms (or re-arms) finalization of a settled turn that OMP may still restart. */
+ const armSettle = (delayMs: number, outcome: { continuationMissing?: boolean } = {}) => {
+  const target = state;
+  if (!target) return;
+  clearTimeout(target.settleTimer);
+  const timer = setTimeout(() => {
+   try {
+    if (state !== target || target.runsOpen > 0) return;
+    finalizeRoot({ cancelled: false, ...outcome });
+    if (!options.replay) void flush();
+   } catch (error) {
+    // A raw timer runs outside OMP's handler isolation; never let it throw.
+    console.error("[pi-langfuse] failed to finalize a settled turn:", error);
+   }
+  }, delayMs);
+  timer.unref?.();
+  target.settleTimer = timer;
  };
 
  /** Point-in-time observation under the open tool call, or the turn. */
@@ -1387,6 +1435,11 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    turnImages: [...promptImages],
    systemPrompt,
    runsOpen: 0,
+   openGenerations: [],
+   awaitingRestart: false,
+   steerPendingStart: false,
+   interrupted: false,
+   steers: 0,
    promptSequence: ++promptSequence,
   };
   liveTurns.set(next.registryKey, next);
@@ -1415,12 +1468,28 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    return;
   }
   if (!options.replay) activeTracingSessions.add(sessionToken);
+  if (state && (state.runsOpen > 0 || state.awaitingRestart)) {
+   // OMP fires before_agent_start for every dequeued steer/follow-up batch,
+   // including one it delivers by aborting and restarting the loop. It belongs
+   // to the running turn, not a new one.
+   state.steers += 1;
+   const images = extractImages(event.images);
+   const content = [event.prompt, ...images.map(describeImage)].filter(Boolean).join("\n");
+   emitTurnEvent(STEER_OBSERVATION_NAME, {
+    input: { role: "user", content },
+    metadata: { steer_index: state.steers },
+   });
+   state.root.update({ metadata: { steer_count: state.steers } });
+   state.steerPendingStart = true;
+   if (state.settleTimer) armSettle(RESTART_GRACE_MS * 5);
+   return;
+  }
   // A superseded run's end can still arrive after the new prompt opens its turn.
-  supersededRunsOpen += (state?.runsOpen ?? 0) + unclaimedRunStarts;
+  supersededRunsOpen += unclaimedRunStarts;
   unclaimedRunStarts = 0;
-  // A turn with no run open ended on `willContinue` and its continuation never
-  // arrived: it completed, nothing cancelled it. A turn mid-run is cut short.
-  if (state) finalizeRoot(state.runsOpen > 0 ? { cancelled: true } : { cancelled: false, continuationMissing: true });
+  // A turn still open here has no run and no restart pending: a prompt-less
+  // run that never reported its start. The new prompt cuts it short.
+  if (state) finalizeRoot({ cancelled: true });
   state = openTurn(ctx, { prompt: event.prompt, images: event.images, systemPrompt: event.systemPrompt, continuation: false });
  });
 
@@ -1445,6 +1514,10 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    unclaimedRunStarts++;
    return;
   }
+  clearTimeout(state.settleTimer);
+  state.settleTimer = undefined;
+  state.awaitingRestart = false;
+  state.steerPendingStart = false;
   state.runsOpen++;
   const systemPrompt = readSystemPrompt(ctx);
   if (!systemPrompt || systemPrompt === state.systemPrompt) return;
@@ -1519,11 +1592,8 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    titleObs.end(now());
    return;
   }
-  if (state.openGeneration && !state.openGeneration.finished) {
-   const gen = state.openGeneration;
-   gen.obs.update({ level: "WARNING", statusMessage: "Superseded by provider retry", metadata: { superseded: true } });
-   gen.obs.end(now());
-  }
+  // The running loop picked the steer up itself; no restart is coming for it.
+  state.steerPendingStart = false;
   const modelSwitch = missingRequest ? undefined : modelSwitchFor(payload);
   if (modelSwitch) {
    emitTurnEvent(SWITCH_MODEL_OBSERVATION_NAME, {
@@ -1565,13 +1635,68 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
      : {}),
    },
   }), { asType: "generation", parentSpanContext: prompt.root.otelSpan.spanContext(), startTime: startedAt }));
-  state.openGeneration = { obs, index, startedAt, sawFirstToken: false, finished: false };
+  state.openGenerations.push({ obs, index, startedAt, sawFirstToken: false, bound: false, finished: false });
  };
  pi.on("before_provider_request", (event, ctx) => startGeneration(event.payload, ctx));
 
+ /**
+  * The open generation an assistant message answers. omp stamps the message with
+  * the time it sent the request, so the request that started nearest to it wins:
+  * a side request (prewalk, memory recall) omp sends while the reply is pending
+  * stays open for `closeUnmatched`. Without a timestamp the newest request is assumed.
+  */
+ const generationFor = (message: unknown): OpenGeneration | undefined => {
+  if (!state) return undefined;
+  const open = state.openGenerations.filter(gen => !gen.finished);
+  const sentAt = message && typeof message === "object" && "timestamp" in message ? message.timestamp : undefined;
+  if (typeof sentAt !== "number") return open.at(-1);
+  let nearest: OpenGeneration | undefined;
+  let distance = Number.POSITIVE_INFINITY;
+  for (const gen of open) {
+   const delta = Math.abs(gen.startedAt.getTime() - sentAt);
+   // Ties go to the newer request, as before omp stamped messages.
+   if (delta <= distance) {
+    distance = delta;
+    nearest = gen;
+   }
+  }
+  return nearest;
+ };
+
+ /**
+  * Requests no assistant message answered: side requests, and requests a retry
+  * replaced. A turn's `turn_end` can arrive after the next request started, so
+  * the sweep leaves requests whose reply is already streaming alone.
+  */
+ const closeUnmatched = (reason: "unmatched_request" | "superseded") => {
+  if (!state) return;
+  const keep: OpenGeneration[] = [];
+  for (const gen of state.openGenerations) {
+   if (gen.finished) continue;
+   if (gen.bound && reason === "unmatched_request") {
+    keep.push(gen);
+    continue;
+   }
+   gen.obs.update({
+    ...(reason === "superseded" ? { level: "WARNING", statusMessage: "Superseded by provider retry" } : {}),
+    metadata: { [reason]: true },
+   });
+   gen.obs.end(now());
+   gen.finished = true;
+  }
+  state.openGenerations = keep;
+ };
+
+ pi.on("message_start", event => {
+  if (event.message.role !== "assistant") return;
+  const gen = generationFor(event.message);
+  if (gen) gen.bound = true;
+ });
+
  pi.on("after_provider_response", event => {
-  const gen = state?.openGeneration;
-  if (!gen || gen.finished) return;
+  // The response follows its request directly; the newest open request is it.
+  const gen = state?.openGenerations.filter(g => !g.finished).at(-1);
+  if (!gen) return;
   gen.obs.update({
    metadata: {
     http_status: event.status,
@@ -1581,8 +1706,10 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
  });
 
  pi.on("message_update", event => {
-  const gen = state?.openGeneration;
-  if (!gen || gen.finished || gen.sawFirstToken) return;
+  const gen = generationFor(event.message);
+  if (!gen) return;
+  gen.bound = true;
+  if (gen.sawFirstToken) return;
   const content = "content" in event.message ? event.message.content : undefined;
   if (
    extractText(content).length > 0 ||
@@ -1594,6 +1721,8 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
   }
  });
 
+ pi.on("turn_end", () => closeUnmatched("unmatched_request"));
+
  pi.on("message_end", (event, ctx) => {
   if (!state) return;
   const message = event.message;
@@ -1602,12 +1731,12 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
   const usage = isUsage(message.usage) ? message.usage : undefined;
   // An archived orphan retains its output and usage without inventing input or
   // choosing one of several possible requests. Live lifecycle behavior is unchanged.
-  if (options.replay && !state.openGeneration) {
+  if (options.replay && !state.openGenerations.some(gen => !gen.finished)) {
    const startedAt = new Date(now().getTime() - (message.duration ?? 0));
    startGeneration(undefined, ctx, true, startedAt);
   }
-  const gen = state.openGeneration;
-  if (!gen || gen.finished) return;
+  const gen = generationFor(message);
+  if (!gen) return;
 
   const text = extractText(message.content);
   const tools = extractToolCalls(message.content);
@@ -1658,7 +1787,7 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
   });
   gen.obs.end(now());
   gen.finished = true;
-  state.openGeneration = undefined;
+  state.openGenerations = state.openGenerations.filter(open => open !== gen);
   if (text) state.lastAssistantText = text;
   state.pendingToolResults = [];
   if (cache?.accountSwitch) {
@@ -1767,6 +1896,8 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
  });
 
  pi.on("auto_retry_start", event => {
+  // The retry re-sends the request; the one it replaces never gets a message.
+  closeUnmatched("superseded");
   emitTurnEvent(RETRY_REQUEST_OBSERVATION_NAME, {
    level: "WARNING",
    statusMessage: event.errorMessage,
@@ -1950,7 +2081,25 @@ export function registerTracing(pi: TracingAPI, config: LangfuseConfig, options:
    return;
   }
   state.runsOpen = Math.max(0, state.runsOpen - 1);
-  if (event.willContinue) return;
+  const last = event.messages.at(-1);
+  const aborted = !!last && last.role === "assistant" && last.stopReason === "aborted";
+  if (aborted) state.interrupted = true;
+  if (event.willContinue) {
+   // The next agent_start rejoins this turn; if the continuation never comes
+   // (it failed silently), the turn still settles.
+   state.awaitingRestart = true;
+   if (state.runsOpen === 0) armSettle(CONTINUATION_GRACE_MS, { continuationMissing: true });
+   return;
+  }
+  // Another loop of this prompt (a steer's restart) is still running and owns the settle.
+  if (state.runsOpen > 0) return;
+  if (aborted || state.steerPendingStart) {
+   // An interrupt, or OMP aborting to deliver a steer and restarting. Keep the
+   // turn briefly so the restart lands in the same trace.
+   state.awaitingRestart = true;
+   armSettle(RESTART_GRACE_MS);
+   return;
+  }
   finalizeRoot({ cancelled: false });
   if (!options.replay) await flush();
   if (ctx.hasUI) ctx.ui?.setStatus("langfuse", "langfuse ✓ (trace sent)");

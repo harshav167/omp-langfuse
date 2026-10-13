@@ -502,39 +502,39 @@ describe("real OMP host prompt interruption tracing", () => {
 
       assert.ok(activeCapture.requests.length > 0, "the real Langfuse exporter must deliver to the local capture server");
       const spans = activeCapture.spans();
+      // A prompt that arrives while the interrupted loop is still open (its
+      // fire-and-forget agent_end held back) is a steer of that turn: one trace,
+      // the interrupt recorded, and nothing the replacement loop did dropped.
       const roots = spans.filter(span => span.name === "omp-agent");
-      assert.equal(roots.length, 2, "the actual old and replacement prompts must each produce one trace root");
-      const oldRoot = roots.find(root => promptOf(root) === INTERRUPTED_PROMPT);
-      const replacementRoot = roots.find(root => promptOf(root) === REPLACEMENT_PROMPT);
-      assert.ok(oldRoot, "the interrupted prompt root must be exported");
-      assert.ok(replacementRoot, "the replacement prompt root must be exported");
-      assert.equal(
-        oldRoot.attrs["langfuse.observation.metadata.cancelled"],
-        "true",
-        "the interrupted root must be marked cancelled",
-      );
-      assert.equal(contentOf(replacementRoot.attrs["langfuse.observation.output"]), FINAL_OUTPUT);
+      assert.equal(roots.length, 1, "the interrupted turn and the prompt delivered into it share one trace root");
+      const root = roots[0]!;
+      assert.equal(promptOf(root), INTERRUPTED_PROMPT);
+      assert.equal(root.attrs["langfuse.observation.metadata.interrupted"], "true", "the interrupt must be recorded");
+      assert.equal(root.attrs["langfuse.observation.metadata.cancelled"], undefined, "a steered turn is not cancelled");
+      assert.equal(root.attrs["langfuse.observation.metadata.steer_count"], "1");
+      assert.equal(contentOf(root.attrs["langfuse.observation.output"]), FINAL_OUTPUT);
 
-      const replacementChildren = spans.filter(
-        span => span.traceId === replacementRoot.traceId && span.spanId !== replacementRoot.spanId,
-      );
-      const generations = replacementChildren.filter(span => span.name === "call-llm");
-      const tools = replacementChildren.filter(span => span.name === "bash");
-      assert.equal(generations.length, 2, "both replacement generations must remain attached to the replacement trace");
+      const children = spans.filter(span => span.traceId === root.traceId && span.spanId !== root.spanId);
+      const steers = children.filter(span => span.name === "steer");
+      assert.equal(steers.length, 1);
+      assert.equal(contentOf(steers[0]!.attrs["langfuse.observation.input"]), REPLACEMENT_PROMPT);
+      const generations = children.filter(span => span.name === "call-llm");
+      const tools = children.filter(span => span.name === "bash");
+      assert.equal(generations.length, 3, "the interrupted stream and both replacement generations stay on the trace");
       assert.equal(tools.length, 1, "the replacement bash call must be exported exactly once");
       const tracedTool = tools[0]!;
-      assert.equal(tracedTool.parentSpanId, replacementRoot.spanId);
+      assert.equal(tracedTool.parentSpanId, root.spanId);
       assert.equal(String(tracedTool.attrs["langfuse.observation.output"]).includes(TOOL_OUTPUT), true);
       assert.ok(generations.some(generation => contentOf(generation.attrs["langfuse.observation.output"]) === FINAL_OUTPUT));
-      const latestChildEndNs = replacementChildren.reduce(
+      const latestChildEndNs = children.reduce(
         (latest, span) => span.endNs > latest ? span.endNs : latest,
         0n,
       );
       assert.ok(
-        replacementRoot.endNs >= latestChildEndNs,
-        "the replacement root's own agent_end must close it after its generations and tool result",
+        root.endNs >= latestChildEndNs,
+        "the turn's final agent_end must close it after its generations and tool result",
       );
-      assert.ok(replacementRoot.endNs > replacementRoot.startNs, "the replacement root must have a real closed interval");
+      assert.ok(root.endNs > root.startNs, "the root must have a real closed interval");
       assert.equal(activeHost.requests.length, 3, "only the interrupted stream and replacement generations reach the mock provider");
     } finally {
       if (host) {
