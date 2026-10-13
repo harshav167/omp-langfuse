@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
-  # pi releases several minor versions each week, so a failure can appear without pull request activity.
+  # omp releases often, so a failure can appear without pull request activity.
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
@@ -15,6 +15,9 @@ concurrency:
   cancel-in-progress: true
 
 permissions: {}
+
+env:
+  BUN_VERSION: 1.4.4
 
 jobs:
   typecheck:
@@ -28,81 +31,48 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          node-version: 22
-          cache: pnpm
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
       - name: Typecheck
-        run: pnpm run typecheck
+        run: bun run typecheck
 
   test:
-    # The suite starts the real pi command-line interface, so a test against
-    # more than one pi release gives an early warning. `pi-version: ""` selects
-    # the version from devDependencies.
-    name: Test (pi ${{ matrix.pi-version || 'devDependency' }}, Node ${{ matrix.node }})
+    # The suite starts the real omp command-line interface from the
+    # devDependency, so the installed build is the one under test.
+    name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        # The scheduled run must find failures that new pi releases cause.
-        # Therefore it uses `latest` only, and it omits the fixed versions.
-        node: ${{ github.event_name == 'schedule' && fromJSON('[22]') || fromJSON('[22, 24]') }}
-        pi-version: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["", "0.83.0", "0.84.1", "latest"]') }}
-    # Reports without gating a pull request; the scheduled run still fails hard. LFE-16666.
-    continue-on-error: ${{ matrix.pi-version == 'latest' && github.event_name != 'schedule' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          node-version: ${{ matrix.node }}
-          cache: pnpm
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Install pi ${{ matrix.pi-version || 'from devDependency' }}
-        # The version goes to the shell as an environment variable, so no
-        # workflow expression becomes executable code.
-        env:
-          PI_VERSION: ${{ matrix.pi-version }}
-        run: |
-          # Every matrix job installs pi with npm. pi has an npm-shrinkwrap.json file
-          # that keeps its dependency versions constant. npm uses this file, but pnpm
-          # does not. This step installs only pi, and it uses a temporary directory.
-          if [ -z "$PI_VERSION" ]; then
-            PI_VERSION="$(node -p "require('$GITHUB_WORKSPACE/node_modules/@earendil-works/pi-coding-agent/package.json').version")"
-            echo "The devDependency resolves to pi $PI_VERSION."
-          fi
-          mkdir -p "$RUNNER_TEMP/pi-matrix"
-          cd "$RUNNER_TEMP/pi-matrix"
-          npm init -y >/dev/null
-          npm install --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
-          echo "PI_BIN=$RUNNER_TEMP/pi-matrix/node_modules/.bin/pi" >> "$GITHUB_ENV"
-          ./node_modules/.bin/pi --version
+        run: bun install --frozen-lockfile
+      - name: Report the omp build under test
+        run: ./node_modules/.bin/omp --version
       - name: Test
-        run: pnpm test
+        run: bun test --timeout 60000 test/*.test.ts
         env:
           PI_SKIP_VERSION_CHECK: "1"
           PI_TELEMETRY: "0"
 
   package:
-    # pi installs extensions with `npm install --legacy-peer-deps`, and that
-    # flag skips peer dependencies. Every other job installs with pnpm, which
-    # does install them, so no other job can see a dependency that the
-    # published package fails to carry.
-    name: Install the packed tarball the way pi does
+    # omp installs extensions with npm, whose `--legacy-peer-deps` skips peer
+    # dependencies. Every other job installs with Bun, which does install them,
+    # so no other job can see a dependency that the published package fails to
+    # carry.
+    name: Install the packed tarball the way omp does
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -112,20 +82,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: pnpm
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
       - name: Pack the tarball
         run: |
           tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")"
           echo "TARBALL=$RUNNER_TEMP/$tarball" >> "$GITHUB_ENV"
-      - name: Install the tarball with pi's flags
+      - name: Install the tarball with omp's flags
         run: |
           mkdir -p "$RUNNER_TEMP/consumer"
           cd "$RUNNER_TEMP/consumer"
@@ -140,7 +105,7 @@ jobs:
           node -e '
             const fs = require("node:fs");
             const path = require("node:path");
-            const allowed = new Set(["@earendil-works/pi-coding-agent"]);
+            const allowed = new Set(["@oh-my-pi/pi-coding-agent"]);
             const root = path.join(process.cwd(), "node_modules");
             const installed = new Map();
             const scan = (dir, scope) => {

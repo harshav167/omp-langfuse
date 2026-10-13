@@ -4,6 +4,7 @@ import { activeToolDefinitions, attachToolDefinitions, type ToolDefinitionInput 
 import {
   type Capture,
   type CapturedSpan,
+  type MockProvider,
   createSandbox,
   runPi,
   startCaptureServer,
@@ -70,13 +71,13 @@ function langfuseEnv(capture: Capture): Record<string, string> {
 
 function generationInputs(spans: CapturedSpan[]): unknown[] {
   return spans
-    .filter((s) => s.name === "LLM Call")
+    .filter((s) => s.name === "call-llm")
     .sort((a, b) => (a.startNs < b.startNs ? -1 : 1))
     .map((s) => JSON.parse(String(s.attrs["langfuse.observation.input"])));
 }
 
 describe("integration: tool definitions", () => {
-  let mock: { port: number; close: () => void };
+  let mock: MockProvider;
 
   before(async () => {
     mock = await startMockProvider();
@@ -85,6 +86,7 @@ describe("integration: tool definitions", () => {
 
   it("attaches the active tools to every generation, as a ChatML message array", async () => {
     const capture = await startCaptureServer();
+    const firstCall = mock.payloads().length;
     try {
       const sandbox = createSandbox(mock.port);
       const result = await runPi(sandbox, "Explore this project and summarize it", { env: langfuseEnv(capture) });
@@ -113,7 +115,7 @@ describe("integration: tool definitions", () => {
         assert.ok(Array.isArray(tools), `generation ${i} must carry tools on its first message`);
         assert.deepEqual(
           tools.map((t) => t.name),
-          ["read", "bash", "edit", "write"],
+          (mock.payloads()[firstCall + i]!.tools as Array<{ function: { name: string } }>).map(tool => tool.function.name),
         );
         for (const tool of tools) {
           assert.equal(typeof tool.description, "string");

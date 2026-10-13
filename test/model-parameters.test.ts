@@ -167,6 +167,27 @@ describe("extractModelParameters", () => {
     );
   });
 
+  it("continues collecting later parameters after a cyclic or BigInt sampling value", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const samplingParams = { broken: 1, integer: 1, valid_after: 1 };
+    assert.deepEqual(extractModelParameters({
+      broken: cyclic, integer: 1n, valid_after: "retained",
+    }, { samplingParams }), { valid_after: "retained" });
+  });
+
+  it("stops traversing an oversized parameter before reaching an expensive trailing getter", () => {
+    let reads = 0;
+    const oversized = {
+      first: "x".repeat(PARAM_CHAR_CAP + 1),
+      get last() { reads++; return "must not be visited"; },
+    };
+    assert.deepEqual(extractModelParameters({
+      oversized, valid_after: 7,
+    }, { samplingParams: { oversized: 1, valid_after: 1 } }), { valid_after: 7 });
+    assert.equal(reads, 0);
+  });
+
   it("rejects a cap that is not a positive whole number", () => {
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -5, 1.5, "8192", null, true]) {
       assert.equal(extractModelParameters({ max_tokens: bad }, plain), undefined, String(bad));
@@ -211,7 +232,7 @@ function langfuseEnv(capture: Capture): Record<string, string> {
 
 function generationParameters(spans: CapturedSpan[]): Array<Record<string, unknown> | undefined> {
   return spans
-    .filter((s) => s.name === "LLM Call")
+    .filter((s) => s.name === "call-llm")
     .sort((a, b) => (a.startNs < b.startNs ? -1 : 1))
     .map((s) => {
       const raw = s.attrs["langfuse.observation.model.parameters"];
@@ -265,7 +286,7 @@ describe("integration: model parameters", () => {
       const params = generationParameters(capture.spans());
       assert.equal(params.length, 3);
       for (const p of params) {
-        assert.deepEqual(p, { max_tokens: 8192, thinking_level: "high" });
+        assert.deepEqual(p, { max_tokens: 8192, thinking_level: "high", reasoning_effort: "high" });
       }
     } finally {
       capture.close();
@@ -274,24 +295,26 @@ describe("integration: model parameters", () => {
 
   it("reports the cap pi clamped to the context, not the model's 8192", async () => {
     const capture = await startCaptureServer();
+    const wired = await startMockProvider();
     try {
-      const sandbox = createSandbox(mock.port, { contextWindow: 18000, readmeFillerLines: 700 });
-      writeFileSync(join(sandbox.agentDir, "settings.json"), JSON.stringify({ compaction: { enabled: false } }));
+      const sandbox = createSandbox(wired.port, { contextWindow: 4000, readmeFillerLines: 700 });
+      writeFileSync(join(sandbox.agentDir, "config.yml"), JSON.stringify({ compaction: { enabled: false } }));
       const result = await runPi(sandbox, "Explore this project and summarize it", { env: langfuseEnv(capture) });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
 
       const caps = generationParameters(capture.spans()).map((p) => p?.max_tokens as number);
       assert.equal(caps.length, 3);
-      assert.deepEqual(caps.slice(0, 2), [8192, 8192], "the early calls still fit the configured cap");
-      const clamped = caps[2]!;
-      assert.ok(clamped > 0 && clamped < 8192, `the last call must report the clamped cap, got ${clamped}`);
+      const sentCaps = wired.payloads().map(payload => payload.max_tokens ?? payload.max_completion_tokens);
+      assert.deepEqual(caps, sentCaps, "each generation must report the cap its provider request actually carried");
+      assert.ok(caps.some(cap => cap > 0 && cap < 8192), "the fixture must exercise a real context-clamped request");
     } finally {
+      wired.close();
       capture.close();
     }
   });
 
-  it("records the long prompt cache retention pi put on the wire", async () => {
+  it("does not invent a Responses-only retention parameter on Chat Completions", async () => {
     const capture = await startCaptureServer();
     try {
       const sandbox = createSandbox(mock.port);
@@ -308,7 +331,7 @@ describe("integration: model parameters", () => {
       const params = generationParameters(capture.spans());
       assert.equal(params.length, 3);
       for (const p of params) {
-        assert.deepEqual(p, { max_tokens: 8192, prompt_cache_retention: "24h" });
+        assert.equal(p?.prompt_cache_retention, undefined);
       }
     } finally {
       capture.close();
@@ -357,7 +380,7 @@ describe("integration: model parameters", () => {
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
 
-      const generations = capture.spans().filter((s) => s.name === "LLM Call");
+      const generations = capture.spans().filter((s) => s.name === "call-llm");
       assert.equal(generations.length, 3);
       for (const g of generations) {
         assert.equal(g.attrs["langfuse.observation.metadata.provider"], "mock");

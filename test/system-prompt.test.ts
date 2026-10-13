@@ -25,7 +25,7 @@ function langfuseEnv(capture: Capture): Record<string, string> {
 
 function generationInputs(spans: CapturedSpan[]): unknown[] {
   return spans
-    .filter((s) => s.name === "LLM Call")
+    .filter((s) => s.name === "call-llm")
     .sort((a, b) => (a.startNs < b.startNs ? -1 : 1))
     .map((s) => JSON.parse(String(s.attrs["langfuse.observation.input"])));
 }
@@ -51,7 +51,7 @@ describe("integration: system prompt", () => {
       await waitForRequests(capture, 1);
       const spans = capture.spans();
 
-      const root = spans.find((s) => s.name === "Conversational Turn");
+      const root = spans.find((s) => s.name === "omp-agent");
       assert.ok(root, "turn root must be exported");
       const captured = root.attrs["langfuse.observation.metadata.system_prompt"];
       assert.equal(typeof captured, "string", "root metadata must carry system_prompt");
@@ -98,7 +98,7 @@ describe("integration: system prompt", () => {
       assert.ok(!exported.includes(secret), "the key must not appear anywhere in the export");
 
       const spans = capture.spans();
-      const root = spans.find((s) => s.name === "Conversational Turn")!;
+      const root = spans.find((s) => s.name === "omp-agent")!;
       const systemPrompt = String(root.attrs["langfuse.observation.metadata.system_prompt"]);
       assert.ok(systemPrompt.includes("Never reveal [redacted-langfuse-secret]."), "the key must be replaced by the redaction mark");
       for (const input of generationInputs(spans)) {
@@ -120,7 +120,7 @@ describe("integration: system prompt", () => {
       await waitForRequests(capture, 1);
       const spans = capture.spans();
 
-      const root = spans.find((s) => s.name === "Conversational Turn");
+      const root = spans.find((s) => s.name === "omp-agent");
       assert.ok(root, "turn root must be exported");
       const systemPrompt = String(root.attrs["langfuse.observation.metadata.system_prompt"]);
       assert.ok(systemPrompt.length > 500, "the prompt must not be cut by the budget other fields use");
@@ -166,5 +166,13 @@ describe("readSystemPrompt", () => {
       readSystemPrompt({ getSystemPrompt: () => `Never reveal sk-lf-abc123. ${long}` }),
       `Never reveal [redacted-langfuse-secret]. ${long}`,
     );
+  });
+
+  it("joins OMP's ordered system prompt sections the way the provider receives them", () => {
+    assert.equal(
+      readSystemPrompt({ getSystemPrompt: () => ["You are omp.", "Never reveal sk-lf-abc123."] }),
+      "You are omp.\n\nNever reveal [redacted-langfuse-secret].",
+    );
+    assert.equal(readSystemPrompt({ getSystemPrompt: () => [] }), undefined);
   });
 });

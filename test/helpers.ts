@@ -6,9 +6,9 @@
  *   realistic usage incl. cache tokens). Prompts containing "[fail]" run a
  *   failing command first, so error paths can be asserted.
  * - startCaptureServer(): fake Langfuse ingest that records every request.
- * - runPi(): spawns the real pi CLI (devDependency) in a throwaway sandbox
- *   (PI_CODING_AGENT_DIR = temp dir), loading the extension via `-e`.
- *   The user's ~/.pi is never touched.
+ * - runPi(): spawns the real OMP CLI (devDependency) in a throwaway sandbox,
+ *   with an isolated HOME and OMP_CODING_AGENT_DIR, loading the extension via `-e`.
+ *   The user's OMP configuration and home directory are never used.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -18,9 +18,16 @@ import { join, resolve } from "node:path";
 import zlib from "node:zlib";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "..");
-// PI_BIN lets CI run the same tests against other pi versions.
-const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "pi");
+// PI_BIN can select another supported OMP build, not the upstream pi CLI.
+const PI_BIN = process.env.PI_BIN || join(REPO_ROOT, "node_modules", ".bin", "omp");
 const EXTENSION = join(REPO_ROOT, "src", "index.ts");
+// OMP-only isolation switches keep ambient extensions, MCP/skills, rules, LSP,
+// terminal input and background title/prewalk work out of deterministic fixtures.
+// The host peer dependency declares OMP >=18.6.0; CI exercises the installed build.
+const OMP_ISOLATION_FLAGS = [
+  "--no-extensions", "--no-skills", "--no-rules", "--no-lsp",
+  "--no-title", "--no-prewalk", "--no-pty",
+] as const;
 
 // --------------------------------------------------------------------------
 // Mock OpenAI-compatible provider
@@ -393,14 +400,17 @@ export function createSandbox(mockPort: number, opts: SandboxOptions = {}): Sand
       },
     }),
   );
-  if (opts.keepRecentTokens !== undefined) {
-    writeFileSync(
-      join(agentDir, "settings.json"),
-      JSON.stringify({
-        compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: opts.keepRecentTokens },
-      }),
-    );
-  }
+  // JSON is a YAML subset; generating it avoids a second fixture serializer.
+  // Ordinary mock conversations deliberately disable unsolicited compaction.
+  // Compaction scenarios opt in through keepRecentTokens and assert native usage.
+  writeFileSync(
+    join(agentDir, "config.yml"),
+    JSON.stringify({
+      compaction: opts.keepRecentTokens === undefined
+        ? { enabled: false }
+        : { enabled: true, reserveTokens: 16384, keepRecentTokens: opts.keepRecentTokens, methodOrder: ["soft"], midTurnEnabled: false },
+    }),
+  );
   return { agentDir, workspace };
 }
 
@@ -418,7 +428,7 @@ export function runPi(
     extensions?: string[];
   } = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  const args = ["-e", EXTENSION];
+  const args = [...OMP_ISOLATION_FLAGS, "-e", EXTENSION];
   for (const extra of opts.extensions ?? []) args.push("-e", extra);
   args.push(
     "--provider",
@@ -427,7 +437,6 @@ export function runPi(
     "mock-gpt-1",
     "--api-key",
     "mock-key",
-    "--no-context-files",
   );
   if (opts.continue) args.push("-c");
   args.push("-p", prompt);
@@ -438,7 +447,14 @@ export function runPi(
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        // Keep global SDK configuration/credential discovery inside this sandbox.
+        HOME: sandbox.agentDir,
+        OMP_PROFILE: "",
+        PI_PROFILE: "",
+        OMP_CODING_AGENT_DIR: sandbox.agentDir,
         PI_CODING_AGENT_DIR: sandbox.agentDir,
+        OMP_RAW_REQUESTS_DIR: join(sandbox.agentDir, "raw-requests"),
+        OMP_RAW_REQUESTS: "1",
         PI_SKIP_VERSION_CHECK: "1",
         PI_TELEMETRY: "0",
         LANGFUSE_PUBLIC_KEY: undefined,

@@ -18,7 +18,9 @@ import {
   toChatMlMessage,
   type ChatMlMessage,
   type PiUsage,
+  type TracingHistoryMessage,
 } from "../src/index.ts";
+import { callAlias, enrichToolResults } from "../src/backfill/normalize.ts";
 
 describe("createSecretRedactor", () => {
   it("redacts Langfuse key tokens in plain strings", () => {
@@ -101,11 +103,10 @@ describe("extractText / extractToolCalls", () => {
     assert.equal(extractText({}), "");
   });
 
-  it("extracts tool calls in the nested shape, without the arguments", () => {
+  it("extracts tool calls in the nested shape with JSON-encoded arguments", () => {
     assert.deepEqual(extractToolCalls(content), [
-      { id: "call_1", type: "function", function: { name: "bash" } },
+      { id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
     ]);
-    assert.ok(!JSON.stringify(extractToolCalls(content)).includes("ls"));
   });
 });
 
@@ -161,7 +162,7 @@ describe("buildUsageDetails / buildCostDetails", () => {
       output: 300,
       cacheRead: 100,
       cacheWrite: 50,
-      reasoning: 200,
+      reasoningTokens: 200,
       cost: { input: 0.001, output: 0.003, cacheRead: 0.00002, cacheWrite: 0.0001875, total: 0.0042075 },
     };
     const usageKeys = Object.keys(buildUsageDetails(withReasoning) ?? {}).sort();
@@ -177,7 +178,7 @@ describe("buildUsageDetails / buildCostDetails", () => {
       output: 300,
       cacheRead: 0,
       cacheWrite: 0,
-      reasoning: 200,
+      reasoningTokens: 200,
       cost: { input: 0.001, output: 0.003, cacheRead: 0, cacheWrite: 0, total: 0.004 },
     });
     // $0.003 for 300 tokens = $0.00001/token: 100 -> $0.001, 200 -> $0.002.
@@ -193,7 +194,7 @@ describe("buildUsageDetails / buildCostDetails", () => {
       output: 587,
       cacheRead: 0,
       cacheWrite: 0,
-      reasoning: 229,
+      reasoningTokens: 229,
       cost: { input: 0, output: 0.008805, cacheRead: 0, cacheWrite: 0, total: 0.008805 },
     };
     const u = buildUsageDetails(usageWithReasoning) ?? {};
@@ -211,7 +212,7 @@ describe("buildUsageDetails / buildCostDetails", () => {
       output: 100,
       cacheRead: 0,
       cacheWrite: 0,
-      reasoning: 300,
+      reasoningTokens: 300,
       cost: { input: 0, output: 0.0015, cacheRead: 0, cacheWrite: 0, total: 0.0015 },
     });
     assert.deepEqual(details, { total: 0.0015, output: 0.0015 });
@@ -233,21 +234,21 @@ describe("buildUsageDetails / buildCostDetails", () => {
 
   it("splits reasoning tokens out of output so the buckets stay exclusive", () => {
     assert.deepEqual(
-      buildUsageDetails({ input: 500, output: 300, cacheRead: 0, cacheWrite: 0, reasoning: 200 }),
+      buildUsageDetails({ input: 500, output: 300, cacheRead: 0, cacheWrite: 0, reasoningTokens: 200 }),
       { input: 500, output: 100, output_reasoning_tokens: 200 },
     );
   });
 
   it("keeps output intact when a provider reports inconsistent reasoning counts", () => {
     assert.deepEqual(
-      buildUsageDetails({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 9 }),
+      buildUsageDetails({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoningTokens: 9 }),
       { input: 10, output: 5 },
     );
   });
 
   it("ignores a zero reasoning count from providers that always report the field", () => {
     assert.deepEqual(
-      buildUsageDetails({ input: 10, output: 20, cacheRead: 0, cacheWrite: 0, reasoning: 0 }),
+      buildUsageDetails({ input: 10, output: 20, cacheRead: 0, cacheWrite: 0, reasoningTokens: 0 }),
       { input: 10, output: 20 },
     );
   });
@@ -255,7 +256,7 @@ describe("buildUsageDetails / buildCostDetails", () => {
   it("emits only the reasoning bucket when all output tokens are reasoning", () => {
     // A model can think and write no text. Then the result has no `output` key.
     assert.deepEqual(
-      buildUsageDetails({ input: 10, output: 50, cacheRead: 0, cacheWrite: 0, reasoning: 50 }),
+      buildUsageDetails({ input: 10, output: 50, cacheRead: 0, cacheWrite: 0, reasoningTokens: 50 }),
       { input: 10, output_reasoning_tokens: 50 },
     );
   });
@@ -602,10 +603,13 @@ describe("toChatMlMessage", () => {
 
   it("drops an assistant message that carries nothing at all", () => {
     assert.equal(toChatMlMessage({ role: "assistant", content: [] }), undefined);
-    assert.equal(
-      toChatMlMessage({ role: "assistant", content: [{ type: "thinking", thinking: "   " }] }),
-      undefined,
-    );
+  });
+
+  it("keeps whitespace-only thinking exactly as the provider sent it", () => {
+    assert.deepEqual(toChatMlMessage({ role: "assistant", content: [{ type: "thinking", thinking: "   " }] }), {
+      role: "assistant",
+      thinking: [{ type: "thinking", content: "   " }],
+    });
   });
 
   it("carries reasoning next to the text and the tool calls of the same step", () => {
@@ -676,6 +680,36 @@ describe("buildHistoryInput", () => {
     assert.equal((history?.[0] as { content: string }).content, "explore this");
   });
 
+  it("keeps unknown tool names absent without discarding their surrounding history", () => {
+    const messages: TracingHistoryMessage[] = [
+      { role: "user", content: "before" },
+      { role: "toolResult", toolCallId: "missing-call", content: "retained result" },
+      { role: "user", content: "after" },
+    ];
+    const before = structuredClone(messages);
+    const enriched = enrichToolResults(messages, "openai-responses");
+    assert.equal(enriched.missingNames, 1);
+    assert.equal(enriched.messages[1]?.toolName, undefined);
+    assert.deepEqual(messages, before);
+    const history = buildHistoryInput(enriched.messages)!;
+    assert.deepEqual(history.map(message => message.role), ["user", "tool", "user"]);
+    assert.ok(history[1]?.role === "tool");
+    assert.equal(history[1].content, "retained result");
+    assert.equal(Object.hasOwn(history[1], "name"), false);
+  });
+
+  it("recovers a tool name without mutating caller-owned provider history", () => {
+    const messages: TracingHistoryMessage[] = [
+      { role: "toolResult", toolCallId: "call-real", content: "result" },
+    ];
+    const enriched = enrichToolResults(messages, "openai-responses", [
+      { id: "call-real|fc-provider", name: "read", api: "openai-responses" },
+    ]);
+    assert.equal(enriched.messages[0]?.toolName, "read");
+    assert.equal(messages[0]?.toolName, undefined);
+    assert.equal(callAlias("call-real|fc-provider", "constructor"), "call-real|fc-provider");
+  });
+
   it("never mutates the messages pi is about to send", () => {
     const messages = structuredClone(conversation);
     const before = JSON.stringify(messages);
@@ -691,7 +725,9 @@ describe("buildHistoryInput", () => {
     assert.equal(history?.length, 2);
     const summary = history?.[0] as { role: string; content: string };
     assert.equal(summary.role, "user");
-    assert.match(summary.content, /compacted into the following summary/);
+    const next = history?.[1];
+    assert.ok(next?.role === "user");
+    assert.equal(next.content, "and now?");
     assert.match(summary.content, /Earlier work\./);
   });
 
@@ -768,23 +804,17 @@ describe("extractThinking", () => {
     assert.ok(!JSON.stringify(parts).includes("ErUBCkYIBRgCKkBd0pd"));
   });
 
-  it("marks a redacted block and carries no withheld payload", () => {
-    assert.deepEqual(
-      extractThinking([
-        {
-          type: "thinking",
-          thinking: "[Reasoning redacted]",
-          thinkingSignature: "opaque-encrypted-payload",
-          redacted: true,
-        },
-      ]),
-      [{ type: "thinking", content: "[Reasoning redacted]", redacted: true }],
-    );
+  it("carries the opaque data of a redactedThinking block as it is", () => {
+    assert.deepEqual(extractThinking([{ type: "redactedThinking", data: "EqQBCkgIARABGAIiQL" }]), [
+      { type: "thinking", content: "EqQBCkgIARABGAIiQL", redacted: true },
+    ]);
   });
 
-  it("skips empty blocks, so a non-reasoning model traces as before", () => {
-    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "" }]), []);
-    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "\n  \t" }]), []);
+  it("keeps every thinking block verbatim, empty and whitespace included", () => {
+    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "" }]), [{ type: "thinking", content: "" }]);
+    assert.deepEqual(extractThinking([{ type: "thinking", thinking: "\n  \t" }]), [
+      { type: "thinking", content: "\n  \t" },
+    ]);
     assert.deepEqual(extractThinking([{ type: "text", text: "no reasoning here" }]), []);
   });
 

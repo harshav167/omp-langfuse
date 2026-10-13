@@ -1,11 +1,11 @@
 {
   "name": "@langfuse/pi-observability-plugin",
-  "version": "0.1.2",
-  "description": "Langfuse observability extension for the pi coding agent — traces prompts, agent turns, model generations, and tool calls to Langfuse.",
+  "version": "0.2.0",
+  "description": "Langfuse observability plugin for oh-my-pi (omp) — traces prompts, agent and subagent turns, model generations, tool calls, retries and compaction to Langfuse.",
   "license": "MIT",
   "author": "Langfuse",
   "type": "module",
-  "packageManager": "pnpm@11.22.0",
+  "packageManager": "bun@1.4.4",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/langfuse/pi-observability-plugin.git"
@@ -15,15 +15,16 @@
   },
   "homepage": "https://github.com/langfuse/pi-observability-plugin#readme",
   "keywords": [
-    "pi-package",
-    "pi-extension",
-    "pi",
+    "omp-plugin",
+    "omp-extension",
+    "omp",
+    "oh-my-pi",
     "langfuse",
     "observability",
     "tracing",
     "opentelemetry"
   ],
-  "pi": {
+  "omp": {
     "extensions": [
       "./src/index.ts"
     ]
@@ -35,12 +36,13 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.ts",
-    "test:unit": "node --test test/unit.test.ts test/config.test.ts"
+    "test": "bun test --timeout 60000 test/*.test.ts",
+    "test:unit": "bun test test/unit.test.ts test/config.test.ts",
+    "backfill": "bun src/backfill.ts"
   },
   "dependencies": {
-    "@langfuse/otel": "^5.10.0",
-    "@langfuse/tracing": "^5.10.0",
+    "@langfuse/otel": "^5.13.0",
+    "@langfuse/tracing": "^5.13.0",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
     "@opentelemetry/resources": "^2.10.0",
@@ -50,12 +52,13 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@oh-my-pi/pi-coding-agent": ">=18.6.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@oh-my-pi/pi-coding-agent": "^18.6.2",
+    "@types/bun": "^1.4.2",
     "@types/node": "^24.0.0",
-    "npm": "11.15.0",
     "typescript": "^5.7.0"
-  }
+  },
+  "workspaces": ["."]
 }

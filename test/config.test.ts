@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { __resetDirsFromEnvForTests } from "@oh-my-pi/pi-utils/dirs";
 import { loadConfig } from "../src/index.ts";
 
 const CONFIG_VARS = [
@@ -15,6 +16,9 @@ const CONFIG_VARS = [
   "LANGFUSE_RELEASE",
   "LANGFUSE_TRACING_ENABLED",
   "PI_CODING_AGENT_DIR",
+  "OMP_CODING_AGENT_DIR",
+  "OMP_PROFILE",
+  "PI_PROFILE",
 ];
 
 describe("loadConfig", () => {
@@ -23,11 +27,12 @@ describe("loadConfig", () => {
 
   beforeEach(() => {
     saved = Object.fromEntries(CONFIG_VARS.map((k) => [k, process.env[k]]));
-    // Point at a fresh, empty agent dir so the developer's real
-    // ~/.pi/agent/langfuse.json can never leak into tests.
+    // The host caches the active profile and directory at import time.
+    // Reset that cache as well as the environment so only this fixture is read.
     agentDir = mkdtempSync(join(tmpdir(), "pi-lf-cfg-"));
     for (const k of CONFIG_VARS) delete process.env[k];
     process.env.PI_CODING_AGENT_DIR = agentDir;
+    __resetDirsFromEnvForTests();
   });
 
   afterEach(() => {
@@ -35,6 +40,8 @@ describe("loadConfig", () => {
       if (saved[k] === undefined) delete process.env[k];
       else process.env[k] = saved[k];
     }
+    __resetDirsFromEnvForTests();
+    rmSync(agentDir, { recursive: true, force: true });
   });
 
   const writeConfigFile = (data: unknown) =>

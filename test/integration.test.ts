@@ -37,6 +37,18 @@ function findSpansByName(spans: CapturedSpan[], name: string): CapturedSpan[] {
   return spans.filter((s) => s.name === name);
 }
 
+function turnRoots(spans: CapturedSpan[]): CapturedSpan[] {
+  return spans.filter(span => span.name === "omp-agent" &&
+    span.attrs["langfuse.observation.metadata.cross_process_subagent"] !== "true");
+}
+
+function subagentRoots(spans: CapturedSpan[]): CapturedSpan[] {
+  return spans.filter(span => span.attrs["langfuse.observation.type"] === "agent" &&
+    (span.attrs["langfuse.observation.metadata.cross_process_subagent"] === "true" ||
+      span.attrs["langfuse.observation.metadata.agent_kind"] === "sub"));
+}
+
+
 function byStart(spans: CapturedSpan[]): CapturedSpan[] {
   return [...spans].sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
 }
@@ -123,29 +135,29 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const spans = capture.spans();
 
       // Root
-      const roots = findSpansByName(spans, "Conversational Turn");
+      const roots = turnRoots(spans);
       assert.equal(roots.length, 1);
       const root = roots[0]!;
       assert.equal(root.parentSpanId, undefined);
-      assert.equal(root.attrs["langfuse.observation.type"], "span");
-      assert.equal(root.attrs["langfuse.trace.name"], "Pi Turn");
+      assert.equal(root.attrs["langfuse.observation.type"], "agent");
+      assert.equal(root.attrs["langfuse.trace.name"], "omp-turn");
       assert.equal(root.attrs["user.id"], "test-user");
       assert.ok(root.attrs["session.id"], "sessionId must be set");
-      assert.deepEqual(root.attrs["langfuse.trace.tags"], ["pi"]);
+      assert.deepEqual(root.attrs["langfuse.trace.tags"], ["omp"]);
 
       // Self identification
       const metadata = (k: string) => root.attrs[`langfuse.observation.metadata.${k}`];
-      assert.equal(metadata("source"), "pi");
+      assert.equal(metadata("source"), "omp");
       assert.equal(metadata("extension"), "@langfuse/pi-observability-plugin");
       // OTLP JSON serializes numbers/booleans in metadata as strings.
       assert.equal(Number(metadata("turn_number")), 1);
 
       // Children: 3 generations + 2 tools, all direct children of the root (flat)
       const tree = spans.filter((s) => s.traceId === root.traceId);
-      const generations = findSpansByName(tree, "LLM Call");
-      const tools = tree.filter((s) => s.name.startsWith("Tool: "));
+      const generations = findSpansByName(tree, "call-llm");
+      const tools = tree.filter(span => ["tool", "retriever"].includes(String(span.attrs["langfuse.observation.type"])));
       assert.equal(generations.length, 3);
-      assert.deepEqual(tools.map((t) => t.name).sort(), ["Tool: bash", "Tool: read"]);
+      assert.deepEqual(tools.map((t) => t.name).sort(), ["bash", "read"]);
       for (const child of [...generations, ...tools]) {
         assert.equal(child.parentSpanId, root.spanId, `${child.name} must be a direct child of the root`);
       }
@@ -155,7 +167,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         assert.ok(generation.attrs["langfuse.observation.completion_start_time"], "TTFT must be set");
       }
       for (const tool of tools) {
-        assert.equal(tool.attrs["langfuse.observation.type"], "tool");
+        assert.equal(tool.attrs["langfuse.observation.type"], tool.name === "read" ? "retriever" : "tool");
       }
 
       // Usage/cost mapping (second generation has cache reads)
@@ -199,7 +211,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       for (const span of tree) {
         assert.equal(span.attrs["session.id"], root.attrs["session.id"], `${span.name} must carry the session id`);
         assert.equal(span.attrs["user.id"], "test-user", `${span.name} must carry the user id`);
-        assert.deepEqual(span.attrs["langfuse.trace.tags"], ["pi"], `${span.name} must carry the tags`);
+        assert.deepEqual(span.attrs["langfuse.trace.tags"], ["omp"], `${span.name} must carry the tags`);
         assert.equal(
           span.attrs["langfuse.trace.name"],
           root.attrs["langfuse.trace.name"],
@@ -219,7 +231,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal((await runPi(sandbox, "First prompt", { env })).status, 0);
       assert.equal((await runPi(sandbox, "Second prompt", { env, continue: true })).status, 0);
       await waitForRequests(capture, 2);
-      const roots = findSpansByName(capture.spans(), "Conversational Turn");
+      const roots = turnRoots(capture.spans());
 
       assert.equal(roots.length, 2);
       const [t1, t2] = [...roots].sort((a, b) => (a.startNs < b.startNs ? -1 : 1));
@@ -249,13 +261,13 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 1);
       const spans = capture.spans();
 
-      const tool = findSpansByName(spans, "Tool: bash")[0];
+      const tool = findSpansByName(spans, "bash")[0];
       assert.ok(tool, "failing bash tool must be traced");
       assert.equal(tool!.attrs["langfuse.observation.level"], "ERROR");
       assert.equal(tool!.attrs["langfuse.observation.status_message"], "Tool execution failed");
       assert.equal(String(tool!.attrs["langfuse.observation.metadata.is_error"]), "true");
 
-      const root = findSpansByName(spans, "Conversational Turn")[0];
+      const root = turnRoots(spans)[0];
       assert.equal(root!.attrs["langfuse.observation.level"], "ERROR", "root reflects that the turn saw an error");
     } finally {
       capture.close();
@@ -314,7 +326,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 1);
       const resource = capture.resourceAttrs();
 
-      assert.match(String(resource["service.name"]), /^unknown_service:/);
+      assert.equal(resource["service.name"], "omp");
       assert.equal(resource["telemetry.sdk.name"], "opentelemetry");
     } finally {
       capture.close();
@@ -337,10 +349,10 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 2, 15_000);
       const spans = capture.spans();
 
-      const parentRoot = findSpansByName(spans, "Conversational Turn")[0];
-      const subagentRoot = findSpansByName(spans, "Subagent Turn")[0];
+      const parentRoot = turnRoots(spans)[0];
+      const subagentRoot = subagentRoots(spans)[0];
       assert.ok(parentRoot, "parent turn must be traced");
-      assert.ok(subagentRoot, "subagent turn must be traced");
+      assert.ok(subagentRoot, `subagent turn must be traced: ${result.stderr}\n${JSON.stringify(spans.map(span => ({ name: span.name, output: span.attrs["langfuse.observation.output"] })))}`);
 
       // The child must join the parent trace.
       assert.equal(subagentRoot!.traceId, parentRoot!.traceId, "subagent must share the parent's trace id");
@@ -365,9 +377,9 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         "subagent spans must join the parent's session",
       );
       assert.equal(subagentRoot!.attrs["user.id"], "test-user", "subagent spans must carry the user id");
-      assert.deepEqual(subagentRoot!.attrs["langfuse.trace.tags"], ["pi"], "subagent spans must carry the tags");
+      assert.deepEqual(subagentRoot!.attrs["langfuse.trace.tags"], ["omp"], "subagent spans must carry the tags");
       const meta = (k: string) => subagentRoot!.attrs[`langfuse.observation.metadata.${k}`];
-      assert.equal(String(meta("pi_subagent")), "true");
+      assert.equal(String(meta("cross_process_subagent")), "true");
       assert.equal(Number(meta("subagent_depth")), 1);
 
       // The model calls of the subagent go in the same trace. Their tokens add
@@ -387,7 +399,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       );
 
       const subagentGenerations = byStart(
-        subagentChildren.filter((s) => s.name === "LLM Call"),
+        subagentChildren.filter((s) => s.name === "call-llm"),
       );
       assert.ok(subagentGenerations.length >= 1, "the subagent must have at least one generation");
       for (const generation of subagentGenerations) {
@@ -398,14 +410,14 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         );
         const history = historyOf(generation);
         assert.equal(history[0]!.role, "user");
-        assert.match(String(history[0]!.content), /^Task: inspect the repository/);
+        assert.match(String(history[0]!.content), /Task: inspect the repository$/);
         assert.ok(
           !contentsOf(generation).some((c) => c.includes("Delegate the repo inspection")),
           "the parent's prompt must not leak into the subagent's history",
         );
       }
       const parentGenerations = byStart(
-        spans.filter((s) => s.name === "LLM Call" && s.parentSpanId === parentRoot!.spanId),
+        spans.filter((s) => s.name === "call-llm" && s.parentSpanId === parentRoot!.spanId),
       );
       assert.ok(
         contentsOf(parentGenerations[0]!).some((c) => c.includes("Delegate the repo inspection")),
@@ -415,7 +427,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         assert.equal(span.traceId, parentRoot!.traceId, `${span.name} must stay in the parent trace`);
       }
 
-      assert.ok(findSpansByName(spans, "Tool: subagent")[0], "the delegating tool call must be traced");
+      assert.ok(findSpansByName(spans, "subagent")[0], "the delegating tool call must be traced");
     } finally {
       capture.close();
     }
@@ -459,18 +471,18 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
 
       const spans = capture.spans();
-      const root = findSpansByName(spans, "Conversational Turn")[0];
+      const root = turnRoots(spans)[0];
       assert.ok(root, "expected a turn root span");
       assert.equal(root!.traceId, appTraceId, "the turn must join the application's trace");
       assert.equal(root!.parentSpanId, appSpanId, "the turn must nest under the application's span");
 
       assert.equal(
-        findSpansByName(spans, "Subagent Turn").length,
+        subagentRoots(spans).length,
         0,
         "an attached run must not be labelled a subagent",
       );
       assert.equal(
-        root!.attrs["langfuse.observation.metadata.pi_subagent"],
+        root!.attrs["langfuse.observation.metadata.cross_process_subagent"],
         undefined,
         "an attached run must not carry subagent metadata",
       );
@@ -498,7 +510,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         assert.equal(span.traceId, appTraceId, `${span.name} must be in the application's trace`);
       }
       assert.ok(
-        spans.some((s) => s.name === "LLM Call"),
+        spans.some((s) => s.name === "call-llm"),
         "the generations must still be traced in attached mode",
       );
     } finally {
@@ -518,7 +530,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
 
-      const root = findSpansByName(capture.spans(), "Conversational Turn")[0];
+      const root = turnRoots(capture.spans())[0];
       assert.ok(root, "expected a turn root span");
       assert.equal(root!.parentSpanId, undefined, "the turn must be its own root");
       assert.notEqual(root!.traceId, "0".repeat(32), "the all-zero trace id must never be adopted");
@@ -565,13 +577,13 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         "external ownership must be published for the child to inherit",
       );
 
-      const parentRoot = findSpansByName(spans, "Conversational Turn")[0];
-      const subagentRoot = findSpansByName(spans, "Subagent Turn")[0];
+      const parentRoot = turnRoots(spans)[0];
+      const subagentRoot = subagentRoots(spans)[0];
       assert.ok(parentRoot, "parent turn must be traced");
       assert.ok(subagentRoot, "the subagent must still be a Subagent Turn, not a second top-level turn");
       assert.equal(subagentRoot!.parentSpanId, parentRoot!.spanId, "the subagent belongs under the turn");
       assert.equal(
-        String(subagentRoot!.attrs["langfuse.observation.metadata.pi_subagent"]),
+        String(subagentRoot!.attrs["langfuse.observation.metadata.cross_process_subagent"]),
         "true",
         "and keeps its subagent metadata",
       );
@@ -606,7 +618,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       );
       assert.equal((await runPi(sandbox, "Trace me via config file")).status, 0);
       await waitForRequests(capture, 1);
-      const root = findSpansByName(capture.spans(), "Conversational Turn")[0];
+      const root = turnRoots(capture.spans())[0];
       assert.ok(root, "config-file-only run must export a trace");
       assert.equal(root!.attrs["user.id"], "file-user");
     } finally {
@@ -636,7 +648,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         .payloads()
         .slice(callsBefore)
         .filter((p) => ((p.tools as unknown[] | undefined) ?? []).length === 0).length;
-      const compactions = findSpansByName(spans, "Compaction");
+      const compactions = findSpansByName(spans, "compact-context");
       assert.ok(summarizationCalls > 0, "pi must have run a compaction summarization");
       assert.equal(
         compactions.length,
@@ -660,7 +672,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.ok(compaction.endNs > compaction.startNs, "compaction span must have a duration");
 
       // Nested under the turn root when the compaction happens inside a turn.
-      const root = findSpansByName(spans, "Conversational Turn")[0]!;
+      const root = turnRoots(spans)[0]!;
       assert.equal(compaction.parentSpanId, root.spanId);
       assert.equal(compaction.traceId, root.traceId);
       assert.equal(compaction.attrs["langfuse.observation.metadata.compaction_reason"], "threshold");
@@ -678,7 +690,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
-      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      const generations = byStart(findSpansByName(capture.spans(), "call-llm"));
       assert.equal(generations.length, 3);
 
       assert.deepEqual(
@@ -700,7 +712,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       for (const generation of generations) {
         const first = historyOf(generation)[0]!;
         assert.equal(first.role, "user");
-        assert.equal(first.content, "Explore this project and summarize it");
+        assert.ok(first.content?.endsWith("Explore this project and summarize it"), "provider-added framing must not drop the original prompt");
       }
 
       const last = historyOf(generations[2]!);
@@ -718,7 +730,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
         assert.ok(call.id, "a tool call must keep its id");
       }
 
-      const root = findSpansByName(capture.spans(), "Conversational Turn")[0]!;
+      const root = turnRoots(capture.spans())[0]!;
       assert.deepEqual(JSON.parse(String(root.attrs["langfuse.observation.input"])), {
         role: "user",
         content: "Explore this project and summarize it",
@@ -738,7 +750,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       });
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
-      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      const generations = byStart(findSpansByName(capture.spans(), "call-llm"));
       const sent = mock.sentMessages.slice(firstCall);
       assert.equal(sent.length, generations.length, "one provider request per generation");
 
@@ -763,18 +775,18 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal((await runPi(sandbox, "Second prompt", { env, continue: true })).status, 0);
       await waitForRequests(capture, 2);
 
-      const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      const roots = byStart(turnRoots(capture.spans()));
       assert.equal(roots.length, 2);
       const secondTurn = byStart(
-        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+        findSpansByName(capture.spans(), "call-llm").filter((s) => s.traceId === roots[1]!.traceId),
       );
       assert.equal(secondTurn.length, 3);
 
       const first = historyOf(secondTurn[0]!);
       assert.equal(first.length, 7, "turn 1 (5 messages) plus the new prompt and its first step");
-      assert.equal(first[0]!.content, "First prompt", "turn 1's prompt must still be there");
+      assert.ok(first[0]!.content?.endsWith("First prompt"), "turn 1's prompt must still be there");
       assert.deepEqual(
-        contentsOf(secondTurn[0]!).filter((c) => c === "First prompt" || c === "Second prompt"),
+        contentsOf(secondTurn[0]!).flatMap(content => content.endsWith("First prompt") ? ["First prompt"] : content.endsWith("Second prompt") ? ["Second prompt"] : []),
         ["First prompt", "Second prompt"],
         "both turns appear, in order",
       );
@@ -801,12 +813,12 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       await waitForRequests(capture, 2);
 
       const spans = capture.spans();
-      assert.equal(findSpansByName(spans, "Compaction").length > 0, true, "a compaction must have happened");
-      const roots = byStart(findSpansByName(spans, "Conversational Turn"));
+      assert.equal(findSpansByName(spans, "compact-context").length > 0, true, "a compaction must have happened");
+      const roots = byStart(turnRoots(spans));
       assert.equal(roots.length, 2);
 
       const beforeCompaction = byStart(
-        findSpansByName(spans, "LLM Call").filter((s) => s.traceId === roots[0]!.traceId),
+        findSpansByName(spans, "call-llm").filter((s) => s.traceId === roots[0]!.traceId),
       );
       const filler = "This paragraph is filler";
       assert.ok(
@@ -815,13 +827,13 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       );
 
       const afterCompaction = byStart(
-        findSpansByName(spans, "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+        findSpansByName(spans, "call-llm").filter((s) => s.traceId === roots[1]!.traceId),
       );
       const first = historyOf(afterCompaction[0]!);
       assert.equal(first[0]!.role, "user");
       assert.match(
         first[0]!.content ?? "",
-        /compacted into the following summary/,
+        /Summary of the earlier work\./,
         "the summary the model sees must be the first message",
       );
       assert.equal(
@@ -849,12 +861,12 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal((await runPi(sandbox, "And the filler text?", { env, continue: true })).status, 0);
       await waitForRequests(capture, 2);
 
-      const roots = byStart(findSpansByName(capture.spans(), "Conversational Turn"));
+      const roots = byStart(turnRoots(capture.spans()));
       const firstTurn = byStart(
-        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[0]!.traceId),
+        findSpansByName(capture.spans(), "call-llm").filter((s) => s.traceId === roots[0]!.traceId),
       );
       const secondTurn = byStart(
-        findSpansByName(capture.spans(), "LLM Call").filter((s) => s.traceId === roots[1]!.traceId),
+        findSpansByName(capture.spans(), "call-llm").filter((s) => s.traceId === roots[1]!.traceId),
       );
       const history = historyOf(secondTurn[0]!);
 
@@ -864,7 +876,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       const toolStep = outputOf(firstTurn[0]!);
       assert.equal(toolStep.thinking, undefined, "a step that did not reason carries no thinking block");
       assert.deepEqual(toolStep.tool_calls, [
-        { id: toolStep.tool_calls![0]!.id, type: "function", function: { name: "bash" } },
+        { id: toolStep.tool_calls![0]!.id, type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
       ]);
 
       const reasoning = history.filter((m) => m.thinking);
@@ -903,7 +915,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
 
-      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      const generations = byStart(findSpansByName(capture.spans(), "call-llm"));
       assert.equal(generations.length, 2);
       const toolOnly = generations[0]!;
 
@@ -935,7 +947,7 @@ describe("integration: pi -> extension -> Langfuse export", () => {
       assert.equal(result.status, 0, `pi failed: ${result.stderr}`);
       await waitForRequests(capture, 1);
 
-      const generations = byStart(findSpansByName(capture.spans(), "LLM Call"));
+      const generations = byStart(findSpansByName(capture.spans(), "call-llm"));
       assert.equal(generations.length, 2);
       const thinkOnly = generations[0]!;
 

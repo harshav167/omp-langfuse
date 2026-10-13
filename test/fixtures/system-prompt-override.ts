@@ -1,8 +1,8 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-export default function (pi: ExtensionAPI) {
+export default function(pi: ExtensionAPI) {
   pi.on("before_agent_start", (_event, ctx) => {
     const suffix = process.env.TEST_SYSTEM_PROMPT_SUFFIX ?? "";
-    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${suffix}` };
+    return { systemPrompt: [...ctx.getSystemPrompt(), suffix] };
   });
 }
